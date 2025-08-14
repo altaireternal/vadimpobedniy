@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-# bot.py — простая и устойчивая версия для Railway / 24/7
-# Урок 1 сразу, далее автораздача раз в сутки. Бонусы сразу.
-# Токен берём из BOT_TOKEN (или TOKEN). Прогресс пишем в /tmp/state.json.
+# Простая и устойчивая версия для Railway (24/7)
+# Урок 1 — сразу. Потом — 1 урок в сутки. Бонусные кнопки всегда видны.
+# Токен берём из переменной окружения BOT_TOKEN (или TOKEN).
+# Прогресс (какой урок уже выдан) сохраняем в /tmp/state.json.
 
 import os, re, json, logging
 from datetime import datetime, timedelta
@@ -12,33 +13,30 @@ from telegram.ext import (
     ApplicationBuilder, Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 
-# ---------- ЛОГИ ----------
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    level=logging.INFO
-)
+# -------- ЛОГИ (чтобы было видно, что происходит) --------
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("bot")
 
-# ---------- НАСТРОЙКИ ----------
+# -------- НАСТРОЙКИ --------
 TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or "").strip()
 YOUR_USERNAME = os.getenv("YOUR_USERNAME", "vadimpobedniy")
 
 YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@Protagonistofgame"
 SONG_URL = "https://youtu.be/-orqHfJdo3E?si=7sCs_q7KTyd0rD8i"
 
-STATE_FILE = "/tmp/state.json"  # Railway: сюда точно можно писать
+STATE_FILE = "/tmp/state.json"  # сюда на Railway можно писать
 
 if not TOKEN:
-    log.error("Не задан BOT_TOKEN. Добавь его в Railway → Variables.")
+    log.error("Не задан BOT_TOKEN. Зайди в Railway → Variables и добавь BOT_TOKEN с токеном бота.")
     raise SystemExit(1)
 
-# ---------- УРОКИ ----------
+# -------- УРОКИ --------
 LESSONS = {
     1: {
         "title": "Урок 1: Цена тени",
         "youtube": "https://youtu.be/ssLtF2UIVVc",
-        "video": None,                  # на Railway видео обычно не храним
-        "auto_file": None,
+        "video": None,                  # видео обычно НЕ храним на Railway
+        "auto_file": None,              # если нужен файл — положи рядом с bot.py
         "links": [
             ("🧭 Получить разбор (Evolution)", "https://evolution.life/p/vadimpobedniy/products"),
             ("ℹ️ Что такое Evolution? (видео)", "https://youtu.be/jjq8STmDlf4?si=EQ9imb8Pw2lE9FTB"),
@@ -49,7 +47,7 @@ LESSONS = {
         "title": "Урок 2: Обнуляем страх",
         "youtube": "https://youtu.be/wRysU2M19vI",
         "video": None,
-        "auto_file": "podcast_30_questions.pdf",   # файл должен лежать рядом с bot.py в репо
+        "auto_file": "podcast_30_questions.pdf",   # положи этот файл в репозиторий рядом с bot.py
         "links": [("📩 Связаться с Вадимом", f"https://t.me/{YOUR_USERNAME}")],
     },
     3: {
@@ -63,7 +61,7 @@ LESSONS = {
         "title": "Урок 4: Выход в эфир = рост возможностей",
         "youtube": "https://youtu.be/YoNxh203KCE",
         "video": None,
-        "auto_file": "open any door.pdf",          # файл должен лежать рядом с bot.py в репо
+        "auto_file": "open any door.pdf",          # положи этот файл в репозиторий рядом с bot.py
         "links": [
             ("📩 Связаться с Вадимом", f"https://t.me/{YOUR_USERNAME}"),
             ("🎵 «Маленькие шаги»", SONG_URL),
@@ -77,24 +75,24 @@ LESSONS = {
     },
 }
 
-# ---------- ПРОГРЕСС ПОЛЬЗОВАТЕЛЕЙ ----------
+# -------- ПРОСТОЕ ХРАНЕНИЕ ПРОГРЕССА --------
 USERS: Dict[str, Dict[str, Any]] = {}
 
 def load_state():
-    """Читаем /tmp/state.json (если нет — стартуем с пустого)."""
+    """Читаем /tmp/state.json (если нет — начинаем с нуля)."""
     global USERS
     try:
-        if os.path.exists(STATE_FILE):
+        if os.path.exists(STATE_FILE) and os.path.getsize(STATE_FILE) > 0:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             for k, v in data.items():
-                if isinstance(v.get("last"), str):
-                    v["last"] = datetime.fromisoformat(v["last"])
+                s = v.get("last")
+                v["last"] = datetime.fromisoformat(s) if isinstance(s, str) else datetime.min
             USERS = data
             log.info(f"Загружено пользователей: {len(USERS)}")
         else:
             USERS = {}
-            log.info("STATE файл отсутствует — начнем с нуля")
+            log.info("STATE не найден или пуст — начнём с нуля")
     except Exception as e:
         log.warning(f"Не удалось загрузить состояние: {e}")
         USERS = {}
@@ -102,15 +100,13 @@ def load_state():
 def save_state():
     """Пишем /tmp/state.json."""
     try:
-        out = {}
-        for k, v in USERS.items():
-            out[k] = {"step": v.get("step", 1), "last": v.get("last", datetime.min).isoformat()}
+        out = {k: {"step": v.get("step", 1), "last": v.get("last", datetime.min).isoformat()} for k, v in USERS.items()}
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.warning(f"Не удалось сохранить состояние: {e}")
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
+# -------- КНОПКИ / ОТПРАВКА --------
 def kb_for_lesson(n: int) -> InlineKeyboardMarkup | None:
     meta = LESSONS[n]
     rows = []
@@ -125,11 +121,13 @@ def kb_for_lesson(n: int) -> InlineKeyboardMarkup | None:
 
 async def send_lesson(context: ContextTypes.DEFAULT_TYPE, chat_id: int, n: int):
     meta = LESSONS[n]
+    # 1) Текст + все кнопки
     await context.bot.send_message(
         chat_id=chat_id,
         text=f"⭐️ {meta['title']}\n\nВыбирай, как удобнее смотреть: YouTube или скачать видео. Бонусы ниже ⤵️",
         reply_markup=kb_for_lesson(n)
     )
+    # 2) Если для урока есть PDF — отправим (если файла нет — просто напишем об этом, бот не упадёт)
     file_path = meta.get("auto_file")
     if file_path:
         if os.path.exists(file_path):
@@ -140,6 +138,7 @@ async def send_lesson(context: ContextTypes.DEFAULT_TYPE, chat_id: int, n: int):
                 await context.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить файл: {file_path}\n{e}")
         else:
             await context.bot.send_message(chat_id=chat_id, text=f"Файл не найден: {file_path}")
+    # 3) Финальная подпись только у 4-го урока
     if n == 4 and meta.get("final_note"):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📩 Связаться с Вадимом", url=f"https://t.me/{YOUR_USERNAME}")],
@@ -148,7 +147,7 @@ async def send_lesson(context: ContextTypes.DEFAULT_TYPE, chat_id: int, n: int):
         ])
         await context.bot.send_message(chat_id=chat_id, text=meta["final_note"], reply_markup=kb)
 
-# ---------- ХЕНДЛЕРЫ ----------
+# -------- КОМАНДЫ --------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     if chat_id not in USERS:
@@ -162,6 +161,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_lesson(context, int(chat_id), cur)
 
 async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной шаг вперёд (если кому-то нужно сразу получить следующий урок)."""
     chat_id = str(update.effective_chat.id)
     if chat_id not in USERS:
         USERS[chat_id] = {"step": 0, "last": datetime.now() - timedelta(days=2)}
@@ -175,6 +175,7 @@ async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_lesson(context, int(chat_id), USERS[chat_id]["step"])
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «Скачать видео», если ты когда-нибудь добавишь локальные mp4."""
     q = update.callback_query
     await q.answer()
     data = (q.data or "").strip()
@@ -197,7 +198,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await context.bot.send_message(chat_id=int(chat_id), text="Видео пока недоступно.")
 
-# ---------- ЕЖЕМИНУТНАЯ ПРОВЕРКА ----------
+# -------- АВТООТПРАВКА РАЗ В СУТКИ --------
 async def tick(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now()
     for chat_id, st in list(USERS.items()):
@@ -208,7 +209,7 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
             save_state()
             await send_lesson(context, int(chat_id), USERS[chat_id]["step"])
 
-# ---------- ЗАПУСК ----------
+# -------- ЗАПУСК --------
 def main():
     log.info("Старт бота…")
     load_state()
@@ -218,7 +219,7 @@ def main():
     app.add_handler(CommandHandler("next", next_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    # Планировщик PTB: проверка каждые 60 сек
+    # Каждую минуту проверяем, кому пора выдать следующий урок
     app.job_queue.run_repeating(tick, interval=60, first=10)
 
     log.info("Бот запущен… (боевой режим: 1 урок/сутки)")
