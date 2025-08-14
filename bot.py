@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-# bot.py — стабильная версия с JobQueue и кнопкой «Скачать материалы»
-# Требуется: python-telegram-bot[job-queue]==20.7 (в requirements.txt)
+# Бот: YouTube + локальные видео/документы + авторассылка раз в 24 часа.
+# Требуется: python-telegram-bot[job-queue]==20.7  (строка в requirements.txt)
 
-import os, re, json, logging
+import os, json, logging, re
 from datetime import datetime, timedelta
 from typing import Dict, Any
 
@@ -18,52 +18,55 @@ log = logging.getLogger("bot")
 TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or "").strip()
 YOUR_USERNAME = os.getenv("YOUR_USERNAME", "vadimpobedniy")
 
-YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@Protagonistofgame"
-SONG_URL = "https://youtu.be/-orqHfJdo3E?si=7sCs_q7KTyd0rD8i"
-STATE_FILE = "/tmp/state.json"  # Railway: сюда точно можно писать
-
 if not TOKEN:
     log.error("Не задан BOT_TOKEN в Railway → Variables.")
     raise SystemExit(1)
 
-# ===== УРОКИ =====
-# В auto_file укажи точное имя файла (с учётом регистра и пробелов),
-# файл должен лежать рядом с bot.py в репозитории.
-LESSONS = {
+STATE_FILE = "/tmp/state.json"   # прогресс пользователей
+MEDIA_DIR  = os.getenv("MEDIA_DIR", "media")  # папка с файлами рядом с bot.py
+
+def P(*parts):  # путь внутри MEDIA_DIR
+    return os.path.join(MEDIA_DIR, *parts)
+
+# ===== УРОКИ (подправь имена файлов под свои; размер видео <= 50 МБ) =====
+LESSONS: Dict[int, Dict[str, Any]] = {
     1: {
         "title": "Урок 1: Цена тени",
         "youtube": "https://youtu.be/ssLtF2UIVVc",
-        "video": None,
-        "auto_file": None,  # например: "lesson1_bonus.pdf" если будет
+        "video_path": P("lesson1.mp4"),                # mp4 16:9
+        "docs": [],                                     # напр. [P("lesson1_bonus.pdf")]
         "links": [
             ("🧭 Получить разбор (Evolution)", "https://evolution.life/p/vadimpobedniy/products"),
             ("ℹ️ Что такое Evolution? (видео)", "https://youtu.be/jjq8STmDlf4?si=EQ9imb8Pw2lE9FTB"),
             ("📩 Связаться с Вадимом", f"https://t.me/{YOUR_USERNAME}"),
         ],
+        "final_note": None,
     },
     2: {
         "title": "Урок 2: Обнуляем страх",
         "youtube": "https://youtu.be/wRysU2M19vI",
-        "video": None,
-        "auto_file": "podcast_30_questions.pdf",
+        "video_path": P("lesson2.mp4"),
+        "docs": [P("podcast_30_questions.pdf")],
         "links": [("📩 Связаться с Вадимом", f"https://t.me/{YOUR_USERNAME}")],
+        "final_note": None,
     },
     3: {
         "title": "Урок 3: Говори так, чтобы тебя слушали",
         "youtube": "https://youtu.be/zc5NLQ3y_68",
-        "video": None,
-        "auto_file": None,  # например: "lesson3_practice.pdf" если будет
+        "video_path": P("lesson3.mp4"),
+        "docs": [],  # напр. [P("lesson3_practice.pdf")]
         "links": [("📩 Связаться с Вадимом", f"https://t.me/{YOUR_USERNAME}")],
+        "final_note": None,
     },
     4: {
         "title": "Урок 4: Выход в эфир = рост возможностей",
         "youtube": "https://youtu.be/YoNxh203KCE",
-        "video": None,
-        "auto_file": "open any door.pdf",
+        "video_path": P("lesson4.mp4"),
+        "docs": [P("open any door.pdf")],
         "links": [
             ("📩 Связаться с Вадимом", f"https://t.me/{YOUR_USERNAME}"),
-            ("🎵 «Маленькие шаги»", SONG_URL),
-            ("📺 Подписаться на YouTube «Главный Герой»", YOUTUBE_CHANNEL_URL),
+            ("🎵 «Маленькие шаги»", "https://youtu.be/-orqHfJdo3E?si=7sCs_q7KTyd0rD8i"),
+            ("📺 Подписаться на YouTube «Главный Герой»", "https://www.youtube.com/@Protagonistofgame"),
         ],
         "final_note": (
             "Благодарю за то, что был со мной эти четыре дня. Я верю в твой успех. "
@@ -73,7 +76,7 @@ LESSONS = {
     },
 }
 
-# ===== ПРОГРЕСС ПОЛЬЗОВАТЕЛЕЙ =====
+# ===== ПРОГРЕСС =====
 USERS: Dict[str, Dict[str, Any]] = {}
 
 def load_state():
@@ -81,69 +84,90 @@ def load_state():
     try:
         if os.path.exists(STATE_FILE) and os.path.getsize(STATE_FILE) > 0:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for k, v in data.items():
-                s = v.get("last")
-                v["last"] = datetime.fromisoformat(s) if isinstance(s, str) else datetime.min
-            USERS = data
+                raw = json.load(f)
+            USERS = {}
+            for cid, st in raw.items():
+                last = st.get("last")
+                USERS[cid] = {
+                    "step": st.get("step", 1),
+                    "last": datetime.fromisoformat(last) if last else datetime.min
+                }
             log.info(f"Загружено пользователей: {len(USERS)}")
         else:
             USERS = {}
-            log.info("STATE не найден или пуст — начнем с нуля")
+            log.info("STATE не найден или пуст — начнём с нуля")
     except Exception as e:
         log.warning(f"Не удалось загрузить состояние: {e}")
         USERS = {}
 
 def save_state():
+    out = {cid: {"step": st.get("step", 1), "last": st.get("last", datetime.min).isoformat()} for cid, st in USERS.items()}
     try:
-        out = {k: {"step": v.get("step", 1), "last": v.get("last", datetime.min).isoformat()} for k, v in USERS.items()}
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.warning(f"Не удалось сохранить состояние: {e}")
 
-# ===== КНОПКИ И ОТПРАВКА =====
-def kb_for_lesson(n: int) -> InlineKeyboardMarkup | None:
+# ===== КНОПКИ =====
+def kb_for_lesson(n: int) -> InlineKeyboardMarkup:
     meta = LESSONS[n]
     rows = []
     if meta.get("youtube"):
         rows.append([InlineKeyboardButton("▶️ Смотреть на YouTube", url=meta["youtube"])])
-    # Кнопка «Скачать материалы» показываем, если В КОДЕ указан auto_file (не проверяем наличие)
-    if meta.get("auto_file"):
-        rows.append([InlineKeyboardButton("📎 Скачать материалы", callback_data=f"dl_doc_{n}")])
-    # Кнопка «Скачать видео (MP4)» — если когда-нибудь добавишь локальные видеофайлы
-    vid = meta.get("video")
-    if vid:
-        rows.append([InlineKeyboardButton("⬇️ Скачать видео (MP4)", callback_data=f"dl_video_{n}")])
+    if meta.get("video_path"):
+        rows.append([InlineKeyboardButton("📥 Скачать видео (MP4 без сжатия)", callback_data=f"dl_video_{n}")])
+    if meta.get("docs"):
+        rows.append([InlineKeyboardButton("📎 Скачать материалы (PDF)", callback_data=f"dl_docs_{n}")])
     for text, url in meta.get("links", []):
         rows.append([InlineKeyboardButton(text, url=url)])
     return InlineKeyboardMarkup(rows) if rows else None
 
+# ===== ОТПРАВКА УРОКА =====
 async def send_lesson(context: ContextTypes.DEFAULT_TYPE, chat_id: int, n: int):
     meta = LESSONS[n]
-    # 1) Текст + кнопки (кнопка «Скачать материалы» уже тут)
+
+    # Сообщение с заголовком + кнопки
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"⭐️ {meta['title']}\n\nВыбирай, как удобнее смотреть: YouTube или скачать. Бонусы ниже ⤵️",
+        text=f"⭐️ {meta['title']}\n\nСмотри на YouTube или скачай оригинал. Бонусы ниже ⤵️",
         reply_markup=kb_for_lesson(n)
     )
-    # 2) Тут же пытаемся отправить файл (если указан) отдельным «бабблом» — это даст «Скачать» прямо в чате
-    file_path = meta.get("auto_file")
-    if file_path:
-        if os.path.exists(file_path):
+
+    # 1) Видео — как video (просмотр 16:9)
+    vpath = meta.get("video_path")
+    if vpath and os.path.exists(vpath):
+        try:
+            with open(vpath, "rb") as vf:
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=vf,
+                    caption=meta["title"],
+                    supports_streaming=True
+                )
+        except Exception as e:
+            await context.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить видео: {e}")
+    elif vpath:
+        await context.bot.send_message(chat_id=chat_id, text=f"Видео не найдено на сервере: {vpath}")
+
+    # 2) Бонусы — как документы (каждый отдельным сообщением)
+    for dpath in meta.get("docs", []):
+        if dpath and os.path.exists(dpath):
             try:
-                with open(file_path, "rb") as f:
+                with open(dpath, "rb") as df:
                     await context.bot.send_document(
                         chat_id=chat_id,
-                        document=f,
-                        filename=os.path.basename(file_path),
+                        document=df,
+                        filename=os.path.basename(dpath),
                         caption="Материалы к уроку"
                     )
             except Exception as e:
-                await context.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить файл: {file_path}\n{e}")
-        else:
-            # файл не нашли — всё равно кнопка есть, при нажатии ещё раз попробуем
-            await context.bot.send_message(chat_id=chat_id, text=f"Пока не вижу файл: {file_path}. Проверь название в репозитории.")
+                await context.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить материалы: {e}")
+        elif dpath:
+            await context.bot.send_message(chat_id=chat_id, text=f"Материал не найден: {dpath}")
+
+    # 3) Финальная подпись в 4-м уроке
+    if n == 4 and meta.get("final_note"):
+        await context.bot.send_message(chat_id=chat_id, text=meta["final_note"], reply_markup=kb_for_lesson(n))
 
 # ===== КОМАНДЫ =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -171,53 +195,61 @@ async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state()
     await send_lesson(context, int(chat_id), USERS[chat_id]["step"])
 
-# ===== ОБРАБОТКА КНОПОК «Скачать …» =====
+# ===== ОБРАБОТКА КНОПОК СКАЧАТЬ =====
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = (q.data or "").strip()
     chat_id = int(q.message.chat.id)
 
-    # Скачать материалы (PDF/док)
-    m = re.match(r"dl_doc_(\d+)$", data)
-    if m:
-        n = int(m.group(1))
-        file_path = LESSONS.get(n, {}).get("auto_file")
-        if file_path and os.path.exists(file_path):
-            try:
-                with open(file_path, "rb") as f:
-                    await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=f,
-                        filename=os.path.basename(file_path),
-                        caption="Материалы к уроку"
-                    )
-            except Exception as e:
-                await context.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить файл: {e}")
-        else:
-            await context.bot.send_message(chat_id=chat_id, text="Материалы пока недоступны. Проверь имя файла в репозитории.")
-        return
-
-    # Скачать видео (если когда-нибудь добавишь локальные mp4)
+    # Скачивание видео как document (без сжатия)
     m = re.match(r"dl_video_(\d+)$", data)
     if m:
         n = int(m.group(1))
-        path = LESSONS.get(n, {}).get("video")
-        if path and os.path.exists(path):
+        vpath = LESSONS.get(n, {}).get("video_path")
+        if vpath and os.path.exists(vpath):
             try:
-                with open(path, "rb") as f:
+                with open(vpath, "rb") as vf:
                     await context.bot.send_document(
                         chat_id=chat_id,
-                        document=f,
-                        filename=os.path.basename(path),
-                        caption=LESSONS[n]["title"]
+                        document=vf,
+                        filename=os.path.basename(vpath),
+                        caption="Скачай оригинальное видео (MP4)"
                     )
             except Exception as e:
                 await context.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить видео: {e}")
         else:
-            await context.bot.send_message(chat_id=chat_id, text="Видео пока недоступно.")
+            await context.bot.send_message(chat_id=chat_id, text="Видео не найдено на сервере.")
+        return
 
-# ===== АВТО-ВЫДАЧА РАЗ В СУТКИ =====
+    # Скачивание всех материалов (PDF/док) по очереди
+    m = re.match(r"dl_docs_(\d+)$", data)
+    if m:
+        n = int(m.group(1))
+        docs = LESSONS.get(n, {}).get("docs") or []
+        if not docs:
+            await context.bot.send_message(chat_id=chat_id, text="Материалы отсутствуют.")
+            return
+        sent_any = False
+        for dpath in docs:
+            if dpath and os.path.exists(dpath):
+                try:
+                    with open(dpath, "rb") as df:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=df,
+                            filename=os.path.basename(dpath),
+                            caption="Материалы к уроку"
+                        )
+                    sent_any = True
+                except Exception as e:
+                    await context.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить: {os.path.basename(dpath)}\n{e}")
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=f"Не найден: {dpath}")
+        if not sent_any:
+            await context.bot.send_message(chat_id=chat_id, text="Материалы сейчас недоступны.")
+
+# ===== АВТО РАЗ В СУТКИ =====
 async def tick(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now()
     for chat_id, st in list(USERS.items()):
@@ -230,21 +262,19 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
 
 # ===== ЗАПУСК =====
 def main():
-    log.info("Старт бота…")
     load_state()
-
     app = ApplicationBuilder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("next", next_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    # Требуется пакет с job-queue (см. requirements.txt)
     if app.job_queue is None:
-        log.error('JobQueue не создан. В requirements.txt должна быть строка: python-telegram-bot[job-queue]==20.7')
+        log.error('Нужен пакет: python-telegram-bot[job-queue]==20.7 в requirements.txt')
         raise SystemExit(1)
-
     app.job_queue.run_repeating(tick, interval=60, first=10)
-    log.info("Бот запущен… (боевой режим: 1 урок/сутки)")
+
+    log.info("Бот запущен… (YouTube + локальные файлы, 1 урок/сутки)")
     app.run_polling()
 
 if __name__ == "__main__":
