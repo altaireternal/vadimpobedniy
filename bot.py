@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 # Бот: YouTube + локальные видео/документы + авторассылка раз в 24 часа.
-# Требуется: python-telegram-bot[job-queue]==20.7  (строка в requirements.txt)
+# Поддерживает файлы как в корне репозитория, так и в папке media/.
+# Требуется: python-telegram-bot[job-queue]==20.7  (в requirements.txt ровно эта строка)
 
 import os, json, logging, re
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -23,18 +24,27 @@ if not TOKEN:
     raise SystemExit(1)
 
 STATE_FILE = "/tmp/state.json"   # прогресс пользователей
-MEDIA_DIR  = os.getenv("MEDIA_DIR", "media")  # папка с файлами рядом с bot.py
 
-def P(*parts):  # путь внутри MEDIA_DIR
-    return os.path.join(MEDIA_DIR, *parts)
+# ---- Хелперы путей ----
+SEARCH_DIRS: List[str] = ["media", "."]  # сначала ищем в media/, затем в корне репо
 
-# ===== УРОКИ (подправь имена файлов под свои; размер видео <= 50 МБ) =====
+def find_path(filename: Optional[str]) -> Optional[str]:
+    """Вернёт полный путь к файлу, если он существует в media/ или в корне репо."""
+    if not filename:
+        return None
+    for base in SEARCH_DIRS:
+        path = os.path.join(base, filename) if base != "." else filename
+        if os.path.exists(path):
+            return path
+    return None
+
+# ===== УРОКИ (подправь имена файлов под свои; видео <= ~50 МБ) =====
 LESSONS: Dict[int, Dict[str, Any]] = {
     1: {
         "title": "Урок 1: Цена тени",
         "youtube": "https://youtu.be/ssLtF2UIVVc",
-        "video_path": P("lesson1.mp4"),                # mp4 16:9
-        "docs": [],                                     # напр. [P("lesson1_bonus.pdf")]
+        "video_file": "lesson1.mp4",                 # ищем сначала media/lesson1.mp4, потом ./lesson1.mp4
+        "docs": [],                                   # напр.: ["lesson1_bonus.pdf"]
         "links": [
             ("🧭 Получить разбор (Evolution)", "https://evolution.life/p/vadimpobedniy/products"),
             ("ℹ️ Что такое Evolution? (видео)", "https://youtu.be/jjq8STmDlf4?si=EQ9imb8Pw2lE9FTB"),
@@ -45,24 +55,24 @@ LESSONS: Dict[int, Dict[str, Any]] = {
     2: {
         "title": "Урок 2: Обнуляем страх",
         "youtube": "https://youtu.be/wRysU2M19vI",
-        "video_path": P("lesson2.mp4"),
-        "docs": [P("podcast_30_questions.pdf")],
+        "video_file": "lesson2.mp4",
+        "docs": ["podcast_30_questions.pdf"],
         "links": [("📩 Связаться с Вадимом", f"https://t.me/{YOUR_USERNAME}")],
         "final_note": None,
     },
     3: {
         "title": "Урок 3: Говори так, чтобы тебя слушали",
         "youtube": "https://youtu.be/zc5NLQ3y_68",
-        "video_path": P("lesson3.mp4"),
-        "docs": [],  # напр. [P("lesson3_practice.pdf")]
+        "video_file": "lesson3.mp4",
+        "docs": [],  # напр.: ["lesson3_practice.pdf"]
         "links": [("📩 Связаться с Вадимом", f"https://t.me/{YOUR_USERNAME}")],
         "final_note": None,
     },
     4: {
         "title": "Урок 4: Выход в эфир = рост возможностей",
         "youtube": "https://youtu.be/YoNxh203KCE",
-        "video_path": P("lesson4.mp4"),
-        "docs": [P("open any door.pdf")],
+        "video_file": "lesson4.mp4",
+        "docs": ["open any door.pdf"],
         "links": [
             ("📩 Связаться с Вадимом", f"https://t.me/{YOUR_USERNAME}"),
             ("🎵 «Маленькие шаги»", "https://youtu.be/-orqHfJdo3E?si=7sCs_q7KTyd0rD8i"),
@@ -114,7 +124,7 @@ def kb_for_lesson(n: int) -> InlineKeyboardMarkup:
     rows = []
     if meta.get("youtube"):
         rows.append([InlineKeyboardButton("▶️ Смотреть на YouTube", url=meta["youtube"])])
-    if meta.get("video_path"):
+    if meta.get("video_file"):
         rows.append([InlineKeyboardButton("📥 Скачать видео (MP4 без сжатия)", callback_data=f"dl_video_{n}")])
     if meta.get("docs"):
         rows.append([InlineKeyboardButton("📎 Скачать материалы (PDF)", callback_data=f"dl_docs_{n}")])
@@ -134,10 +144,10 @@ async def send_lesson(context: ContextTypes.DEFAULT_TYPE, chat_id: int, n: int):
     )
 
     # 1) Видео — как video (просмотр 16:9)
-    vpath = meta.get("video_path")
-    if vpath and os.path.exists(vpath):
+    vfile = find_path(meta.get("video_file"))
+    if vfile:
         try:
-            with open(vpath, "rb") as vf:
+            with open(vfile, "rb") as vf:
                 await context.bot.send_video(
                     chat_id=chat_id,
                     video=vf,
@@ -146,12 +156,13 @@ async def send_lesson(context: ContextTypes.DEFAULT_TYPE, chat_id: int, n: int):
                 )
         except Exception as e:
             await context.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить видео: {e}")
-    elif vpath:
-        await context.bot.send_message(chat_id=chat_id, text=f"Видео не найдено на сервере: {vpath}")
+    elif meta.get("video_file"):
+        await context.bot.send_message(chat_id=chat_id, text=f"Видео не найдено на сервере: {meta['video_file']}")
 
     # 2) Бонусы — как документы (каждый отдельным сообщением)
-    for dpath in meta.get("docs", []):
-        if dpath and os.path.exists(dpath):
+    for dname in meta.get("docs", []):
+        dpath = find_path(dname)
+        if dpath:
             try:
                 with open(dpath, "rb") as df:
                     await context.bot.send_document(
@@ -162,8 +173,8 @@ async def send_lesson(context: ContextTypes.DEFAULT_TYPE, chat_id: int, n: int):
                     )
             except Exception as e:
                 await context.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить материалы: {e}")
-        elif dpath:
-            await context.bot.send_message(chat_id=chat_id, text=f"Материал не найден: {dpath}")
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=f"Материал не найден: {dname}")
 
     # 3) Финальная подпись в 4-м уроке
     if n == 4 and meta.get("final_note"):
@@ -206,14 +217,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = re.match(r"dl_video_(\d+)$", data)
     if m:
         n = int(m.group(1))
-        vpath = LESSONS.get(n, {}).get("video_path")
-        if vpath and os.path.exists(vpath):
+        meta = LESSONS.get(n, {})
+        vfile = find_path(meta.get("video_file"))
+        if vfile:
             try:
-                with open(vpath, "rb") as vf:
+                with open(vfile, "rb") as vf:
                     await context.bot.send_document(
                         chat_id=chat_id,
                         document=vf,
-                        filename=os.path.basename(vpath),
+                        filename=os.path.basename(vfile),
                         caption="Скачай оригинальное видео (MP4)"
                     )
             except Exception as e:
@@ -231,8 +243,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=chat_id, text="Материалы отсутствуют.")
             return
         sent_any = False
-        for dpath in docs:
-            if dpath and os.path.exists(dpath):
+        for dname in docs:
+            dpath = find_path(dname)
+            if dpath:
                 try:
                     with open(dpath, "rb") as df:
                         await context.bot.send_document(
@@ -245,7 +258,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     await context.bot.send_message(chat_id=chat_id, text=f"Не удалось отправить: {os.path.basename(dpath)}\n{e}")
             else:
-                await context.bot.send_message(chat_id=chat_id, text=f"Не найден: {dpath}")
+                await context.bot.send_message(chat_id=chat_id, text=f"Не найден: {dname}")
         if not sent_any:
             await context.bot.send_message(chat_id=chat_id, text="Материалы сейчас недоступны.")
 
@@ -272,6 +285,7 @@ def main():
     if app.job_queue is None:
         log.error('Нужен пакет: python-telegram-bot[job-queue]==20.7 в requirements.txt')
         raise SystemExit(1)
+    # проверка раз в минуту, выдача следующего урока если прошло ≥ 24 часа
     app.job_queue.run_repeating(tick, interval=60, first=10)
 
     log.info("Бот запущен… (YouTube + локальные файлы, 1 урок/сутки)")
