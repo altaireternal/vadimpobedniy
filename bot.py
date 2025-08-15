@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Бот: только кнопки (YouTube + "Скачать видео" + "Скачать материалы"), БЕЗ авто-видео/превью.
+# Бот: YouTube + скачивание оригиналов по кнопкам, без авто-видео/превью.
 # Авто-выдача следующего урока каждые 24 часа через JobQueue.
 # Требуется: python-telegram-bot[job-queue]==20.7  (ровно эта строка в requirements.txt)
 
@@ -8,32 +8,32 @@ import re
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 
-# ---------- ЛОГИ ----------
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("bot")
 
-# ---------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------
+# ===== НАСТРОЙКИ =====
 TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or "").strip()
 YOUR_USERNAME = os.getenv("YOUR_USERNAME", "vadimpobedniy")
+STATE_FILE = "/tmp/state.json"
+
+# Админы (только им доступны /users /stuck1 /stats /checkfiles)
+ADMIN_IDS = {"444338007"}  # добавь при необходимости ещё ID как строки
 
 if not TOKEN:
     log.error("Не задан BOT_TOKEN в Railway → Variables.")
     raise SystemExit(1)
 
-STATE_FILE = "/tmp/state.json"   # прогресс пользователей (куда дошёл, когда был прошлый урок)
-
 # Где ищем файлы: сперва в media/, потом в корне репозитория
 SEARCH_DIRS: List[str] = ["media", "."]
 
 def find_path(filename: Optional[str]) -> Optional[str]:
-    """Найдёт фактический путь к файлу в media/ или в корне. Вернёт None, если не найден."""
     if not filename:
         return None
     for base in SEARCH_DIRS:
@@ -42,15 +42,13 @@ def find_path(filename: Optional[str]) -> Optional[str]:
             return path
     return None
 
-# ---------- КОНФИГ УРОКОВ ----------
-# ВАЖНО: имена файлов должны совпадать с тем, что в репозитории (регистр, пробелы).
-# Видео ≤ ~50 МБ (лимит Telegram для бота при локальной отправке).
+# ===== УРОКИ =====
 LESSONS: Dict[int, Dict[str, Any]] = {
     1: {
         "title": "Урок 1: Цена тени",
         "youtube": "https://youtu.be/ssLtF2UIVVc",
-        "video_file": "lesson1.mp4",            # отправляется ТОЛЬКО по кнопке как документ (без сжатия)
-        "docs": [],                             # напр.: ["lesson1_bonus.pdf"]
+        "video_file": "lesson1.mp4",
+        "docs": [],
         "links": [
             ("🧭 Получить разбор (Evolution)", "https://evolution.life/p/vadimpobedniy/products"),
             ("ℹ️ Что такое Evolution? (видео)", "https://youtu.be/jjq8STmDlf4?si=EQ9imb8Pw2lE9FTB"),
@@ -70,7 +68,7 @@ LESSONS: Dict[int, Dict[str, Any]] = {
         "title": "Урок 3: Говори так, чтобы тебя слушали",
         "youtube": "https://youtu.be/zc5NLQ3y_68",
         "video_file": "lesson3.mp4",
-        "docs": [],  # напр.: ["lesson3_practice.pdf"]
+        "docs": [],
         "links": [("📩 Связаться с Вадимом", f"https://t.me/{YOUR_USERNAME}")],
         "final_note": None,
     },
@@ -92,7 +90,7 @@ LESSONS: Dict[int, Dict[str, Any]] = {
     },
 }
 
-# ---------- ПРОГРЕСС ПОЛЬЗОВАТЕЛЕЙ ----------
+# ===== ПРОГРЕСС ПОЛЬЗОВАТЕЛЕЙ =====
 USERS: Dict[str, Dict[str, Any]] = {}  # chat_id -> {"step": int, "last": datetime}
 
 def load_state() -> None:
@@ -127,41 +125,32 @@ def save_state() -> None:
     except Exception as e:
         log.warning(f"Не удалось сохранить состояние: {e}")
 
-# ---------- КНОПКИ ----------
+# ===== КНОПКИ =====
 def kb_for_lesson(n: int) -> InlineKeyboardMarkup:
     meta = LESSONS[n]
     rows: List[List[InlineKeyboardButton]] = []
-
     if meta.get("youtube"):
         rows.append([InlineKeyboardButton("▶️ Смотреть на YouTube", url=meta["youtube"])])
-
     if meta.get("video_file"):
         rows.append([InlineKeyboardButton("📥 Скачать видео (MP4, без сжатия)", callback_data=f"dl_video_{n}")])
-
     if meta.get("docs"):
         rows.append([InlineKeyboardButton("📎 Скачать материалы (PDF)", callback_data=f"dl_docs_{n}")])
-
     for text, url in meta.get("links", []):
         rows.append([InlineKeyboardButton(text, url=url)])
-
     return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
 
-# ---------- ОТПРАВКА УРОКА (ТОЛЬКО ТЕКСТ + КНОПКИ) ----------
+# ===== ОТПРАВКА УРОКА (ТОЛЬКО ТЕКСТ + КНОПКИ) =====
 async def send_lesson(context: ContextTypes.DEFAULT_TYPE, chat_id: int, n: int) -> None:
     meta = LESSONS[n]
-
-    # Сообщение с заголовком + кнопки. НИКАКИХ авто-видео/превью!
     await context.bot.send_message(
         chat_id=chat_id,
         text=f"⭐️ {meta['title']}\n\nВыбирай: смотреть на YouTube или скачать оригиналы кнопками ниже ⤵️",
         reply_markup=kb_for_lesson(n)
     )
-
-    # Финальная подпись в 4-м уроке (тоже без авто-медиа)
     if n == 4 and meta.get("final_note"):
         await context.bot.send_message(chat_id=chat_id, text=meta["final_note"], reply_markup=kb_for_lesson(n))
 
-# ---------- КОМАНДЫ ----------
+# ===== КОМАНДЫ ПОЛЬЗОВАТЕЛЯ =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = str(update.effective_chat.id)
     if chat_id not in USERS:
@@ -187,14 +176,14 @@ async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_state()
     await send_lesson(context, int(chat_id), USERS[chat_id]["step"])
 
-# ---------- ОБРАБОТКА КНОПОК (ОТПРАВКА ФАЙЛОВ ТОЛЬКО ПО ТРЕБОВАНИЮ) ----------
+# ===== ОБРАБОТКА КНОПОК (ОТПРАВКА ФАЙЛОВ ПО ТРЕБОВАНИЮ) =====
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
     data = (q.data or "").strip()
     chat_id = int(q.message.chat.id)
 
-    # 1) Скачать ВИДЕО как документ (оригинальный MP4, без сжатия и превью)
+    # Скачать видео как документ
     m = re.match(r"dl_video_(\d+)$", data)
     if m:
         n = int(m.group(1))
@@ -216,7 +205,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_message(chat_id=chat_id, text=f"Видео не найдено: {vname or '—'}")
         return
 
-    # 2) Скачать ДОКУМЕНТЫ (PDF и др.) — каждый отдельным сообщением
+    # Скачать все материалы
     m = re.match(r"dl_docs_(\d+)$", data)
     if m:
         n = int(m.group(1))
@@ -245,7 +234,94 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_message(chat_id=chat_id, text="Материалы сейчас недоступны.")
         return
 
-# ---------- АВТОВЫДАЧА КАЖДЫЕ 24 ЧАСА ----------
+# ===== АДМИН-ХЕЛПЕРЫ =====
+def _is_admin(chat_id: int) -> bool:
+    return str(chat_id) in ADMIN_IDS
+
+def _stats_counts() -> Tuple[int, Dict[int, int]]:
+    total = len(USERS)
+    by_step: Dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0}
+    for st in USERS.values():
+        by_step[st.get("step", 1)] = by_step.get(st.get("step", 1), 0) + 1
+    return total, by_step
+
+# ===== АДМИН-КОМАНДЫ =====
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_chat.id):
+        return
+    if not USERS:
+        await update.message.reply_text("Пока никто не нажимал /start.")
+        return
+    lines: List[str] = []
+    for uid, st in USERS.items():
+        step = st.get("step", 1)
+        last = st.get("last")
+        last_str = last.strftime("%Y-%m-%d %H:%M") if hasattr(last, "strftime") else str(last)
+        lines.append(f"{uid} — урок {step} (последний: {last_str})")
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 4000:
+            await update.message.reply_text(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        await update.message.reply_text(chunk)
+
+async def stuck1_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_chat.id):
+        return
+    stuck = []
+    for uid, st in USERS.items():
+        if st.get("step", 1) == 1:
+            last = st.get("last")
+            last_str = last.strftime("%Y-%m-%d %H:%M") if hasattr(last, "strftime") else str(last)
+            stuck.append(f"{uid} — урок 1 (последний: {last_str})")
+    if not stuck:
+        await update.message.reply_text("Никто не застрял на уроке 1 🎉")
+        return
+    chunk = ""
+    for line in stuck:
+        if len(chunk) + len(line) + 1 > 4000:
+            await update.message.reply_text(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        await update.message.reply_text(chunk)
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_chat.id):
+        return
+    total, by_step = _stats_counts()
+    msg = (
+        f"📊 Статистика\n"
+        f"Всего пользователей: {total}\n"
+        f"• Урок 1: {by_step.get(1,0)}\n"
+        f"• Урок 2: {by_step.get(2,0)}\n"
+        f"• Урок 3: {by_step.get(3,0)}\n"
+        f"• Урок 4: {by_step.get(4,0)}\n"
+    )
+    await update.message.reply_text(msg)
+
+async def checkfiles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_chat.id):
+        return
+    lines: List[str] = []
+    lines.append("🗂 Проверка файлов (ищем в media/ и в корне)")
+    for n, meta in LESSONS.items():
+        title = meta.get("title", f"Урок {n}")
+        vname = meta.get("video_file")
+        vpath = find_path(vname) if vname else None
+        lines.append(f"[{n}] {title}")
+        lines.append(f"  video: {vname} -> {'OK' if vpath else 'NOT FOUND'}")
+        for dname in meta.get("docs", []):
+            dpath = find_path(dname)
+            lines.append(f"  doc:   {dname} -> {'OK' if dpath else 'NOT FOUND'}")
+    text = "\n".join(lines)
+    while text:
+        await update.message.reply_text(text[:3900])
+        text = text[3900:]
+
+# ===== АВТОВЫДАЧА КАЖДЫЕ 24 ЧАСА =====
 async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now()
     for chat_id, st in list(USERS.items()):
@@ -257,23 +333,30 @@ async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             save_state()
             await send_lesson(context, int(chat_id), USERS[chat_id]["step"])
 
-# ---------- ЗАПУСК ----------
+# ===== ЗАПУСК =====
 def main() -> None:
     load_state()
     app = ApplicationBuilder().token(TOKEN).build()
 
+    # команды для пользователей
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("next", next_cmd))
+
+    # обработка кнопок скачивания
     app.add_handler(CallbackQueryHandler(on_callback))
+
+    # админ-команды
+    app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("stuck1", stuck1_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("checkfiles", checkfiles_cmd))
 
     if app.job_queue is None:
         log.error('Нужен пакет: python-telegram-bot[job-queue]==20.7 в requirements.txt')
         raise SystemExit(1)
-
-    # Проверяем раз в минуту, пора ли выдать следующий урок (прошли сутки)
     app.job_queue.run_repeating(tick, interval=60, first=10)
 
-    log.info("Бот запущен… (YouTube + скачивание по кнопкам, 1 урок/сутки, без авто-видео)")
+    log.info("Бот запущен… (YouTube + кнопки скачивания, 1 урок/сутки, без авто-видео)")
     app.run_polling()
 
 if __name__ == "__main__":
