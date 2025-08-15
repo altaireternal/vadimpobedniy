@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Бот: YouTube + скачивание оригиналов по кнопкам (без авто-видео/превью).
-# Авто-выдача следующего урока каждые 24 часа через JobQueue.
-# Требуется: python-telegram-bot[job-queue]==20.7  (ровно эта строка в requirements.txt)
+# Выдаёт следующий урок каждые 24 часа (JobQueue).
+# Требуется: python-telegram-bot[job-queue]==20.7  (эта строка должна быть в requirements.txt)
 
 import os
 import re
@@ -23,20 +23,20 @@ log = logging.getLogger("bot")
 TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or "").strip()
 YOUR_USERNAME = os.getenv("YOUR_USERNAME", "vadimpobedniy")
 
-# ПЕРСИСТЕНТНОЕ ХРАНИЛИЩЕ (Railway Volume монтируем в /app/data)
+# Постоянное хранилище (Railway Volume смонтируй в /app/data)
 DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 USERS_CSV  = os.path.join(DATA_DIR, "users.csv")
 
 # Админы (кому доступны /users /stuck1 /stats /checkfiles /exportusers)
-ADMIN_IDS = {"444338007"}  # добавь при необходимости ещё ID как строки
+ADMIN_IDS = {"444338007"}  # добавь ещё ID при необходимости
 
 if not TOKEN:
     log.error("Не задан BOT_TOKEN в Railway → Variables.")
     raise SystemExit(1)
 
-# Где ищем файлы с уроками: сперва в media/, затем в корне репо
+# Где ищем файлы уроков: сначала в media/, затем в корне репо
 SEARCH_DIRS: List[str] = ["media", "."]
 
 def find_path(filename: Optional[str]) -> Optional[str]:
@@ -82,7 +82,7 @@ LESSONS: Dict[int, Dict[str, Any]] = {
         "title": "Урок 4: Выход в эфир = рост возможностей",
         "youtube": "https://youtu.be/YoNxh203KCE",
         "video_file": "lesson4.mp4",
-        "docs": ["open any door.pdf"],   # проверь точное имя файла в репо
+        "docs": ["open any door.pdf"],  # проверь точное имя
         "links": [
             ("📩 Связаться с Вадимом", f"https://t.me/{YOUR_USERNAME}"),
             ("🎵 «Маленькие шаги»", "https://youtu.be/-orqHfJdo3E?si=7sCs_q7KTyd0rD8i"),
@@ -131,7 +131,6 @@ def save_state() -> None:
     except Exception as e:
         log.warning(f"Не удалось сохранить состояние: {e}")
 
-# Запись в CSV «кто впервые нажал старт»
 def _append_user_csv(chat_id: str, when: datetime) -> None:
     try:
         seen = set()
@@ -206,7 +205,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = (q.data or "").strip()
     chat_id = int(q.message.chat.id)
 
-    # Скачать видео как документ (без сжатия)
+    # Скачать видео как документ
     m = re.match(r"dl_video_(\d+)$", data)
     if m:
         n = int(m.group(1))
