@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-# Бот: YouTube + скачивание оригиналов по кнопкам, без авто-видео/превью.
+# Бот: YouTube + скачивание оригиналов по кнопкам (без авто-видео/превью).
 # Авто-выдача следующего урока каждые 24 часа через JobQueue.
 # Требуется: python-telegram-bot[job-queue]==20.7  (ровно эта строка в requirements.txt)
 
 import os
 import re
+import csv
 import json
 import logging
 from datetime import datetime, timedelta
@@ -21,16 +22,21 @@ log = logging.getLogger("bot")
 # ===== НАСТРОЙКИ =====
 TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or "").strip()
 YOUR_USERNAME = os.getenv("YOUR_USERNAME", "vadimpobedniy")
-STATE_FILE = "/tmp/state.json"
 
-# Админы (только им доступны /users /stuck1 /stats /checkfiles)
+# ПЕРСИСТЕНТНОЕ ХРАНИЛИЩЕ (Railway Volume монтируем в /app/data)
+DATA_DIR = "/app/data"
+os.makedirs(DATA_DIR, exist_ok=True)
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+USERS_CSV  = os.path.join(DATA_DIR, "users.csv")
+
+# Админы (кому доступны /users /stuck1 /stats /checkfiles /exportusers)
 ADMIN_IDS = {"444338007"}  # добавь при необходимости ещё ID как строки
 
 if not TOKEN:
     log.error("Не задан BOT_TOKEN в Railway → Variables.")
     raise SystemExit(1)
 
-# Где ищем файлы: сперва в media/, потом в корне репозитория
+# Где ищем файлы с уроками: сперва в media/, затем в корне репо
 SEARCH_DIRS: List[str] = ["media", "."]
 
 def find_path(filename: Optional[str]) -> Optional[str]:
@@ -76,7 +82,7 @@ LESSONS: Dict[int, Dict[str, Any]] = {
         "title": "Урок 4: Выход в эфир = рост возможностей",
         "youtube": "https://youtu.be/YoNxh203KCE",
         "video_file": "lesson4.mp4",
-        "docs": ["open any door.pdf"],
+        "docs": ["open any door.pdf"],   # проверь точное имя файла в репо
         "links": [
             ("📩 Связаться с Вадимом", f"https://t.me/{YOUR_USERNAME}"),
             ("🎵 «Маленькие шаги»", "https://youtu.be/-orqHfJdo3E?si=7sCs_q7KTyd0rD8i"),
@@ -125,6 +131,22 @@ def save_state() -> None:
     except Exception as e:
         log.warning(f"Не удалось сохранить состояние: {e}")
 
+# Запись в CSV «кто впервые нажал старт»
+def _append_user_csv(chat_id: str, when: datetime) -> None:
+    try:
+        seen = set()
+        if os.path.exists(USERS_CSV):
+            with open(USERS_CSV, "r", newline="", encoding="utf-8") as f:
+                for row in csv.reader(f):
+                    if row:
+                        seen.add(row[0])
+        if chat_id not in seen:
+            with open(USERS_CSV, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow([chat_id, when.isoformat()])
+    except Exception as e:
+        log.warning(f"Не удалось обновить {USERS_CSV}: {e}")
+
 # ===== КНОПКИ =====
 def kb_for_lesson(n: int) -> InlineKeyboardMarkup:
     meta = LESSONS[n]
@@ -156,6 +178,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat_id not in USERS:
         USERS[chat_id] = {"step": 1, "last": datetime.now()}
         save_state()
+        _append_user_csv(chat_id, USERS[chat_id]["last"])
         await update.message.reply_text("🚀 Стартуем. Твой первый урок готов 👇")
         await send_lesson(context, int(chat_id), 1)
     else:
@@ -183,7 +206,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = (q.data or "").strip()
     chat_id = int(q.message.chat.id)
 
-    # Скачать видео как документ
+    # Скачать видео как документ (без сжатия)
     m = re.match(r"dl_video_(\d+)$", data)
     if m:
         n = int(m.group(1))
@@ -234,7 +257,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_message(chat_id=chat_id, text="Материалы сейчас недоступны.")
         return
 
-# ===== АДМИН-ХЕЛПЕРЫ =====
+# ===== АДМИН-ХЕЛПЕРЫ и КОМАНДЫ =====
 def _is_admin(chat_id: int) -> bool:
     return str(chat_id) in ADMIN_IDS
 
@@ -242,10 +265,10 @@ def _stats_counts() -> Tuple[int, Dict[int, int]]:
     total = len(USERS)
     by_step: Dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0}
     for st in USERS.values():
-        by_step[st.get("step", 1)] = by_step.get(st.get("step", 1), 0) + 1
+        s = st.get("step", 1)
+        by_step[s] = by_step.get(s, 0) + 1
     return total, by_step
 
-# ===== АДМИН-КОМАНДЫ =====
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin(update.effective_chat.id):
         return
@@ -321,6 +344,23 @@ async def checkfiles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(text[:3900])
         text = text[3900:]
 
+async def exportusers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_chat.id):
+        return
+    if not os.path.exists(USERS_CSV):
+        await update.message.reply_text("Файл с пользователями пока не создан.")
+        return
+    try:
+        with open(USERS_CSV, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=f,
+                filename="users.csv",
+                caption="Список пользователей (chat_id, дата первого старта)"
+            )
+    except Exception as e:
+        await update.message.reply_text(f"Не удалось отправить CSV: {e}")
+
 # ===== АВТОВЫДАЧА КАЖДЫЕ 24 ЧАСА =====
 async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now()
@@ -338,11 +378,11 @@ def main() -> None:
     load_state()
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # команды для пользователей
+    # пользовательские команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("next", next_cmd))
 
-    # обработка кнопок скачивания
+    # обработка кнопок
     app.add_handler(CallbackQueryHandler(on_callback))
 
     # админ-команды
@@ -350,6 +390,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stuck1", stuck1_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("checkfiles", checkfiles_cmd))
+    app.add_handler(CommandHandler("exportusers", exportusers_cmd))
 
     if app.job_queue is None:
         log.error('Нужен пакет: python-telegram-bot[job-queue]==20.7 в requirements.txt')
